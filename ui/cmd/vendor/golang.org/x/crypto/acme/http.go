@@ -10,10 +10,12 @@ import (
 	"crypto"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -64,7 +66,7 @@ func (c *Client) retryTimer() *retryTimer {
 // The n argument is always bounded between 1 and 30.
 // The returned value is always greater than 0.
 func defaultBackoff(n int, r *http.Request, res *http.Response) time.Duration {
-	const max = 10 * time.Second
+	const maxVal = 10 * time.Second
 	var jitter time.Duration
 	if x, err := rand.Int(rand.Reader, big.NewInt(1000)); err == nil {
 		// Set the minimum to 1ms to avoid a case where
@@ -84,10 +86,7 @@ func defaultBackoff(n int, r *http.Request, res *http.Response) time.Duration {
 		n = 30
 	}
 	d := time.Duration(1<<uint(n-1))*time.Second + jitter
-	if d > max {
-		return max
-	}
-	return d
+	return min(d, maxVal)
 }
 
 // retryAfter parses a Retry-After HTTP header value,
@@ -129,7 +128,7 @@ func wantStatus(codes ...int) resOkay {
 func (c *Client) get(ctx context.Context, url string, ok resOkay) (*http.Response, error) {
 	retry := c.retryTimer()
 	for {
-		req, err := http.NewRequest("GET", url, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -155,8 +154,16 @@ func (c *Client) get(ctx context.Context, url string, ok resOkay) (*http.Respons
 	}
 }
 
+// postAsGet is POST-as-GET, a replacement for GET in RFC 8555
+// as described in https://tools.ietf.org/html/rfc8555#section-6.3.
+// It makes a POST request in KID form with zero JWS payload.
+// See nopayload doc comments in jws.go.
+func (c *Client) postAsGet(ctx context.Context, url string, ok resOkay) (*http.Response, error) {
+	return c.post(ctx, nil, url, noPayload, ok)
+}
+
 // post issues a signed POST request in JWS format using the provided key
-// to the specified URL.
+// to the specified URL. If key is nil, c.Key is used instead.
 // It returns a non-error value only when ok reports true.
 //
 // post retries unsuccessful attempts according to c.RetryBackoff
@@ -193,18 +200,35 @@ func (c *Client) post(ctx context.Context, key crypto.Signer, url string, body i
 }
 
 // postNoRetry signs the body with the given key and POSTs it to the provided url.
-// The body argument must be JSON-serializable.
 // It is used by c.post to retry unsuccessful attempts.
+// The body argument must be JSON-serializable.
+//
+// If key argument is nil, c.Key is used to sign the request.
+// If key argument is nil and c.accountKID returns a non-zero keyID,
+// the request is sent in KID form. Otherwise, JWK form is used.
+//
+// In practice, when interfacing with RFC-compliant CAs most requests are sent in KID form
+// and JWK is used only when KID is unavailable: new account endpoint and certificate
+// revocation requests authenticated by a cert key.
+// See jwsEncodeJSON for other details.
 func (c *Client) postNoRetry(ctx context.Context, key crypto.Signer, url string, body interface{}) (*http.Response, *http.Request, error) {
+	kid := noKeyID
+	if key == nil {
+		if c.Key == nil {
+			return nil, nil, errors.New("acme: Client.Key must be populated to make POST requests")
+		}
+		key = c.Key
+		kid = c.accountKID(ctx)
+	}
 	nonce, err := c.popNonce(ctx, url)
 	if err != nil {
 		return nil, nil, err
 	}
-	b, err := jwsEncodeJSON(body, key, nonce)
+	b, err := jwsEncodeJSON(body, key, kid, nonce, url)
 	if err != nil {
 		return nil, nil, err
 	}
-	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -219,6 +243,7 @@ func (c *Client) postNoRetry(ctx context.Context, key crypto.Signer, url string,
 
 // doNoRetry issues a request req, replacing its context (if any) with ctx.
 func (c *Client) doNoRetry(ctx context.Context, req *http.Request) (*http.Response, error) {
+	req.Header.Set("User-Agent", c.userAgent())
 	res, err := c.httpClient().Do(req.WithContext(ctx))
 	if err != nil {
 		select {
@@ -241,6 +266,41 @@ func (c *Client) httpClient() *http.Client {
 		return c.HTTPClient
 	}
 	return http.DefaultClient
+}
+
+// packageVersion is the version of the module that contains this package, for
+// sending as part of the User-Agent header.
+var packageVersion string
+
+func init() {
+	// Set packageVersion if the binary was built in modules mode and x/crypto
+	// was not replaced with a different module.
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	for _, m := range info.Deps {
+		if m.Path != "golang.org/x/crypto" {
+			continue
+		}
+		if m.Replace == nil {
+			packageVersion = m.Version
+		}
+		break
+	}
+}
+
+// userAgent returns the User-Agent header value. It includes the package name,
+// the module version (if available), and the c.UserAgent value (if set).
+func (c *Client) userAgent() string {
+	ua := "golang.org/x/crypto/acme"
+	if packageVersion != "" {
+		ua += "@" + packageVersion
+	}
+	if c.UserAgent != "" {
+		ua = c.UserAgent + " " + ua
+	}
+	return ua
 }
 
 // isBadNonce reports whether err is an ACME "badnonce" error.
@@ -266,7 +326,7 @@ func isRetriable(code int) bool {
 func responseError(resp *http.Response) error {
 	// don't care if ReadAll returns an error:
 	// json.Unmarshal will fail in that case anyway
-	b, _ := ioutil.ReadAll(resp.Body)
+	b, _ := io.ReadAll(resp.Body)
 	e := &wireError{Status: resp.StatusCode}
 	if err := json.Unmarshal(b, e); err != nil {
 		// this is not a regular error response:
